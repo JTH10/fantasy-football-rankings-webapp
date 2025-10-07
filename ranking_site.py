@@ -12,33 +12,24 @@ from html import unescape
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYERS_FILE = os.path.join(BASE_DIR, "players.json")
 NOT_RANKED = 1000
-DEBUG = True  # set to False for production
 CURRENT_SEASON = datetime.datetime.now().year
-
-# NFL season start
 NFL_SEASON_START = datetime.date(2025, 9, 2)  # manually update each season
-
-# canonical position order used by frontend and rendering
 POSITION_ORDER = ["QB", "WR", "RB", "TE", "K", "DEF"]
 
 # ---------- Helpers ----------
 def normalize_name(name):
-    name = unescape(name)
-    name = name.lower()
-    # Replace all apostrophe-like chars with straight apostrophe '
+    name = unescape(name).lower()
     name = re.sub(r"[’‘‛❛❜ʻʼʽʾʿˈˊ]", "'", name)
-    name = re.sub(r'\b(jr\.?|sr\.?|ii|iii|iv|v)\b', '', name)  # Remove suffixes
-    name = re.sub(r"[^\w\s']", '', name)  # Allow apostrophes only, remove other punctuation
-    name = re.sub(r'\s+', ' ', name)  # Normalize spaces
+    name = re.sub(r'\b(jr\.?|sr\.?|ii|iii|iv|v)\b', '', name)
+    name = re.sub(r"[^\w\s']", '', name)
+    name = re.sub(r'\s+', ' ', name)
     return name.strip()
 
 def get_current_nfl_week():
-    today = datetime.date.today()
-    delta_days = (today - NFL_SEASON_START).days
+    delta_days = (datetime.date.today() - NFL_SEASON_START).days
     if delta_days < 0:
         return 1
-    week = delta_days // 7 + 1
-    return min(week, 17)  # max 17 weeks in regular season
+    return min(delta_days // 7 + 1, 17)
 
 # ---------- Player class ----------
 class Player:
@@ -56,15 +47,10 @@ class Player:
 
     def average_rank(self):
         ranks = [r for r in [self.nfl_rank, self.rotopat_rank, self.fantasypros_rank] if r is not None and r != NOT_RANKED]
-        if not ranks:
-            return NOT_RANKED
-        return sum(ranks) / len(ranks)
+        return sum(ranks) / len(ranks) if ranks else NOT_RANKED
 
     def to_dict(self):
         return {"name": self.name, "position": self.position}
-
-    def __repr__(self):
-        return f"{self.name} ({self.position})"
 
 # ---------- Persistence ----------
 def load_players():
@@ -88,39 +74,32 @@ def load_players():
         ]
         with open(PLAYERS_FILE, "w") as f:
             json.dump(default_players, f, indent=2)
-
     with open(PLAYERS_FILE, "r") as f:
         data = json.load(f)
     return [Player(p["name"], p["position"]) for p in data]
 
 def save_players(player_objs):
-    data = [p.to_dict() for p in player_objs]
     with open(PLAYERS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump([p.to_dict() for p in player_objs], f, indent=2)
 
 # ---------- Grouping ----------
 def group_players_by_position(players):
     grouped = defaultdict(list)
     for player in players:
         grouped[player.position].append(player)
-    # ensure consistent order (POSITION_ORDER)
-    ordered = {}
-    for pos in POSITION_ORDER:
-        ordered[pos] = grouped.get(pos, [])
+    ordered = {pos: grouped.get(pos, []) for pos in POSITION_ORDER}
     for pos, lst in grouped.items():
         if pos not in ordered:
             ordered[pos] = lst
     return ordered
 
-# ---------- NFL.com Logic ----------
+# ---------- NFL.com ----------
 def fetch_nfl_rankings(position, week):
     url = f"https://fantasy.nfl.com/research/rankings?leagueId=0&position={position}&statSeason={CURRENT_SEASON}&statType=weekStats&week={week}"
     try:
         resp = requests.get(url, timeout=10)
         return BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        if DEBUG:
-            print(f"[fetch_nfl_rankings] exception: {e}")
+    except Exception:
         return BeautifulSoup("", "html.parser")
 
 def get_nfl_ranks(doc, player_names):
@@ -129,29 +108,18 @@ def get_nfl_ranks(doc, player_names):
         ranks[name] = NOT_RANKED
         try:
             matches = doc.find_all(string=lambda s: s and name.lower() in s.lower())
-            if not matches:
-                continue
-            node = matches[0]
-            tr = node.find_parent("tr")
-            if tr:
-                for td in tr.find_all("td"):
-                    m = re.search(r'(\d+)', td.get_text(strip=True))
-                    if m:
-                        ranks[name] = int(m.group(1))
-                        break
-        except Exception as e:
-            if DEBUG:
-                print(f"[NFL] exception for {name}: {e}")
+            node = matches[0] if matches else None
+            if node:
+                tr = node.find_parent("tr")
+                if tr:
+                    for td in tr.find_all("td"):
+                        m = re.search(r'(\d+)', td.get_text(strip=True))
+                        if m:
+                            ranks[name] = int(m.group(1))
+                            break
+        except Exception:
             ranks[name] = NOT_RANKED
     return ranks
-
-def debug_find_nfl_snippet(position, week, player_name):
-    doc = fetch_nfl_rankings(position, week)
-    matches = doc.find_all(string=lambda s: s and player_name.lower() in s.lower())
-    if not matches:
-        return {"found": False, "message": "No text match found", "sample_html": str(doc)[:2000]}
-    node = matches[0]
-    return {"found": True, "snippet": str(node.parent)[:5000]}
 
 # ---------- RotoPat ----------
 def fetch_rotopat_doc(position, week):
@@ -160,9 +128,7 @@ def fetch_rotopat_doc(position, week):
     try:
         r = requests.get(url, timeout=10)
         return BeautifulSoup(r.content, "html.parser")
-    except Exception as e:
-        if DEBUG:
-            print(f"[fetch_rotopat_doc] exception: {e}")
+    except Exception:
         return BeautifulSoup("", "html.parser")
 
 def get_rotopat_ranks(doc, player_names):
@@ -172,27 +138,24 @@ def get_rotopat_ranks(doc, player_names):
         ranks[name] = NOT_RANKED
         try:
             cell = next((td for td in doc.find_all("td") if normalized_target in normalize_name(td.get_text())), None)
-            if not cell:
-                continue
-            row = cell.find_parent("tr")
-            bold = row.find("b") if row else None
-            if bold:
-                mm = re.search(r'(\d+)', bold.get_text(strip=True))
-                if mm:
-                    ranks[name] = int(mm.group(1))
-            elif row:
-                for td in row.find_all("td"):
-                    mm = re.search(r'(\d+)', td.get_text(strip=True))
-                    if mm:
-                        ranks[name] = int(mm.group(1))
-                        break
-        except Exception as e:
-            if DEBUG:
-                print(f"[RotoPat] exception for {name}: {e}")
+            row = cell.find_parent("tr") if cell else None
+            if row:
+                bold = row.find("b")
+                if bold:
+                    m = re.search(r'(\d+)', bold.get_text(strip=True))
+                    if m:
+                        ranks[name] = int(m.group(1))
+                else:
+                    for td in row.find_all("td"):
+                        m = re.search(r'(\d+)', td.get_text(strip=True))
+                        if m:
+                            ranks[name] = int(m.group(1))
+                            break
+        except Exception:
             ranks[name] = NOT_RANKED
     return ranks
 
-# ---------- FantasyPros ECR ----------
+# ---------- FantasyPros ----------
 def fetch_fantasypros_ecr(position):
     pos_map = {"QB": "qb", "RB": "rb", "WR": "wr", "TE": "te", "K": "k", "DEF": "dst"}
     pos_param = pos_map.get(position.upper())
@@ -202,12 +165,8 @@ def fetch_fantasypros_ecr(position):
     try:
         r = requests.get(url, timeout=10)
         match = re.search(r'var ecrData = (\{.*?\});', r.text, re.DOTALL)
-        if not match:
-            return {}
-        return json.loads(match.group(1))
-    except Exception as e:
-        if DEBUG:
-            print(f"[FantasyPros] exception: {e}")
+        return json.loads(match.group(1)) if match else {}
+    except Exception:
         return {}
 
 def get_fantasypros_ranks(data, player_names):
@@ -221,11 +180,9 @@ def get_fantasypros_ranks(data, player_names):
                 break
     return ranks
 
-# ---------- Main ranking logic ----------
+# ---------- Ranking logic ----------
 def get_rankings(week=None):
-    if week is None:
-        week = get_current_nfl_week()
-
+    week = week or get_current_nfl_week()
     players = load_players()
     grouped = group_players_by_position(players)
     all_rankings = {}
@@ -247,7 +204,7 @@ def get_rankings(week=None):
                 fp_ranks.get(player.name, NOT_RANKED)
             )
 
-        sorted_players = sorted(players, key=lambda p: (p.average_rank() if p.average_rank() != NOT_RANKED else 9999))
+        sorted_players = sorted(players, key=lambda p: p.average_rank() if p.average_rank() != NOT_RANKED else 9999)
         all_rankings[position] = [
             {
                 "name": player.name,
@@ -260,30 +217,18 @@ def get_rankings(week=None):
 
     return all_rankings
 
-# ---------- Flask app ----------
+# ---------- Flask App ----------
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
 @app.route('/')
 def home():
     week_param = request.args.get('week')
-    if week_param and week_param.isdigit() and 1 <= int(week_param) <= 17:
-        week = int(week_param)
-    else:
-        week = get_current_nfl_week()
-    
-    return render_template(
-        "index.html",
-        week=week,
-        position_order=POSITION_ORDER,
-        github="https://github.com/JTH10",
-        author="Justin Henrie"
-    )
+    week = int(week_param) if week_param and week_param.isdigit() and 1 <= int(week_param) <= 17 else get_current_nfl_week()
+    return render_template("index.html", week=week, position_order=POSITION_ORDER, github="https://github.com/JTH10", author="Justin Henrie")
 
-# Players API
 @app.route('/players', methods=['GET'])
 def api_get_players():
-    players = load_players()
-    grouped = group_players_by_position(players)
+    grouped = group_players_by_position(load_players())
     return jsonify({pos: [p.to_dict() for p in grouped[pos]] for pos in grouped})
 
 @app.route('/players', methods=['POST'])
@@ -308,29 +253,13 @@ def api_delete_player(name):
     save_players(new_players)
     return jsonify({"message": "Player deleted"}), 200
 
-# Rankings API
 @app.route('/rankings')
 def api_rankings():
     week_param = request.args.get('week')
     week = int(week_param) if week_param and week_param.isdigit() and 1 <= int(week_param) <= 17 else get_current_nfl_week()
-    data = get_rankings(week)
-    return jsonify(data)
+    return jsonify(get_rankings(week))
 
-# Debug endpoint
-@app.route('/debug_nfl')
-def debug_nfl():
-    if not DEBUG:
-        return jsonify({"error": "Disabled"}), 403
-    player = request.args.get('player')
-    position = request.args.get('position', 'WR')
-    week = int(request.args.get('week', get_current_nfl_week()))
-    if not player:
-        return jsonify({"error": "Provide ?player=NAME"}), 400
-    try:
-        res = debug_find_nfl_snippet(position, week, player)
-        return jsonify(res)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True)
+# ---------- Entry Point ----------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
