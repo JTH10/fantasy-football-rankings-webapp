@@ -1,23 +1,83 @@
+"""
+Fantasy Football Rankings Web App
+---------------------------------
+
+A Flask-based web application that aggregates fantasy football player rankings
+from multiple public sources (NFL.com, RotoPat/NBC Sports, and FantasyPros),
+combines them into an averaged ranking, and serves both an interactive frontend
+and a JSON API.
+
+Key Features:
+- Fetches live weekly rankings from external sources.
+- Allows users to add or remove players from a persistent roster.
+- Stores player data in a database (SQLite locally, Supabase Postgres in production).
+- Exposes clean JSON endpoints for integration or automation.
+
+Tech Stack:
+- Flask (backend & templating)
+- SQLAlchemy (ORM / DB abstraction)
+- BeautifulSoup + Requests (web scraping)
+- Hosted on Render with Supabase as the managed database.
+
+Author: JT Henrie
+Repository: https://github.com/JTH10/fantasy-football-webapp
+License: MIT
+"""
+
+# mypy: ignore-missing-imports
+
+# stdlib
+import datetime
+import json
 import os
 import re
-import json
-import datetime
+from collections import defaultdict
+from html import unescape
+from typing import Any, Dict, List, Optional
+
+# third-party
 import requests
 from bs4 import BeautifulSoup
-from collections import defaultdict
-from flask import Flask, jsonify, request, render_template
-from html import unescape
+from flask import Flask, jsonify, render_template, request
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PLAYERS_FILE = os.path.join(BASE_DIR, "players.json")
+
+DB_URL = os.environ.get("DATABASE_URL")  # Supabase on Render
+if not DB_URL:
+    # Fallback to local SQLite if DATABASE_URL is not set
+    DB_URL = f"sqlite:///{os.path.join(BASE_DIR, 'players.db')}"
+
+engine = create_engine(DB_URL, pool_pre_ping=True)
+
+PLAYERS_TEMPLATE = os.path.join(BASE_DIR, "players.json")
 NOT_RANKED = 1000
 CURRENT_SEASON = datetime.datetime.now().year
-NFL_SEASON_START = datetime.date(2025, 9, 2)  # manually update each season
+NFL_SEASON_START = datetime.date(2025, 9, 2)  # manually update each season - Tuesday before 1st regular season game.
 POSITION_ORDER = ["QB", "WR", "RB", "TE", "K", "DEF"]
 
+DEFAULT_PLAYERS = [
+    {"name": "Patrick Mahomes", "position": "QB"},
+    {"name": "Brian Thomas Jr.", "position": "WR"},
+    {"name": "Terry McLaurin", "position": "WR"},
+    {"name": "Chris Olave", "position": "WR"},
+    {"name": "Deebo Samuel Sr.", "position": "WR"},
+    {"name": "Wan'Dale Robinson", "position": "WR"},
+    {"name": "Bijan Robinson", "position": "RB"},
+    {"name": "Tony Pollard", "position": "RB"},
+    {"name": "Quinshon Judkins", "position": "RB"},
+    {"name": "Rhamondre Stevenson", "position": "RB"},
+    {"name": "Woody Marks", "position": "RB"},
+    {"name": "Kyle Pitts", "position": "RB"},
+    {"name": "Trey McBride", "position": "TE"},
+    {"name": "Brandon Aubrey", "position": "K"},
+    {"name": "Buffalo Bills", "position": "DEF"}
+]
 # ---------- Helpers ----------
-def normalize_name(name):
+def normalize_name(name: str) -> str:
     name = unescape(name).lower()
     name = re.sub(r"[’‘‛❛❜ʻʼʽʾʿˈˊ]", "'", name)
     name = re.sub(r'\b(jr\.?|sr\.?|ii|iii|iv|v)\b', '', name)
@@ -25,7 +85,7 @@ def normalize_name(name):
     name = re.sub(r'\s+', ' ', name)
     return name.strip()
 
-def get_current_nfl_week():
+def get_current_nfl_week() -> int:
     delta_days = (datetime.date.today() - NFL_SEASON_START).days
     if delta_days < 0:
         return 1
@@ -33,57 +93,115 @@ def get_current_nfl_week():
 
 # ---------- Player class ----------
 class Player:
-    def __init__(self, name, position):
-        self.name = name
-        self.position = position
-        self.nfl_rank = None
-        self.rotopat_rank = None
-        self.fantasypros_rank = None
+    def __init__(self, name: str, position: str) -> None:
+        self.name: str = name
+        self.position: str = position
+        self.nfl_rank: Optional[int] = None
+        self.rotopat_rank: Optional[int] = None
+        self.fantasypros_rank: Optional[int] = None
 
-    def set_ranks(self, nfl_rank, rotopat_rank, fantasypros_rank=None):
+    def set_ranks(
+        self,
+        nfl_rank: Optional[int],
+        rotopat_rank: Optional[int],
+        fantasypros_rank: Optional[int] = None,
+    ) -> None:
         self.nfl_rank = nfl_rank
         self.rotopat_rank = rotopat_rank
         self.fantasypros_rank = fantasypros_rank
 
-    def average_rank(self):
-        ranks = [r for r in [self.nfl_rank, self.rotopat_rank, self.fantasypros_rank] if r is not None and r != NOT_RANKED]
+    def average_rank(self) -> float | int:
+        ranks: List[int] = [
+            r for r in [self.nfl_rank, self.rotopat_rank, self.fantasypros_rank]
+            if r is not None and r != NOT_RANKED
+        ]
         return sum(ranks) / len(ranks) if ranks else NOT_RANKED
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, str]:
         return {"name": self.name, "position": self.position}
 
 # ---------- Persistence ----------
-def load_players():
-    if not os.path.exists(PLAYERS_FILE):
-        default_players = [
-            {"name": "Patrick Mahomes", "position": "QB"},
-            {"name": "Brian Thomas Jr.", "position": "WR"},
-            {"name": "Terry McLaurin", "position": "WR"},
-            {"name": "Chris Olave", "position": "WR"},
-            {"name": "Deebo Samuel Sr.", "position": "WR"},
-            {"name": "Wan'Dale Robinson", "position": "WR"},
-            {"name": "Darnell Mooney", "position": "WR"},
-            {"name": "Bijan Robinson", "position": "RB"},
-            {"name": "Tony Pollard", "position": "RB"},
-            {"name": "Quinshon Judkins", "position": "RB"},
-            {"name": "Rhamondre Stevenson", "position": "RB"},
-            {"name": "Trey McBride", "position": "TE"},
-            {"name": "Brandon Aubrey", "position": "K"},
-            {"name": "Minnesota Vikings", "position": "DEF"},
-            {"name": "Denver Broncos", "position": "DEF"}
-        ]
-        with open(PLAYERS_FILE, "w") as f:
-            json.dump(default_players, f, indent=2)
-    with open(PLAYERS_FILE, "r") as f:
-        data = json.load(f)
-    return [Player(p["name"], p["position"]) for p in data]
+def _ensure_template_file():
+    if os.path.exists(PLAYERS_TEMPLATE):
+        return
+    try:
+        with open(PLAYERS_TEMPLATE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_PLAYERS, f, indent=2)
+    except OSError:
+        pass
 
-def save_players(player_objs):
-    with open(PLAYERS_FILE, "w") as f:
-        json.dump([p.to_dict() for p in player_objs], f, indent=2)
+
+def _load_template_players():
+    _ensure_template_file()
+    try:
+        with open(PLAYERS_TEMPLATE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return [p for p in data if isinstance(p, dict) and "name" in p and "position" in p]
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_PLAYERS.copy()
+
+
+_storage_initialized = False
+
+def _init_storage():
+    global _storage_initialized
+    if _storage_initialized:
+        return
+
+    # Create table if it doesn't exist (works on both SQLite and Postgres)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS players (
+                name TEXT PRIMARY KEY,
+                position TEXT NOT NULL
+            )
+        """))
+
+        # Seed from template once if empty
+        count = conn.execute(text("SELECT COUNT(*) FROM players")).scalar() or 0
+        if count == 0:
+            seed_players = _load_template_players()
+            if seed_players:
+                conn.execute(
+                    text("INSERT INTO players (name, position) VALUES (:name, :position)"),
+                    seed_players
+                )
+
+    _storage_initialized = True
+
+
+def load_players() -> List[Player]:
+    _init_storage()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT name, position FROM players ORDER BY name")
+        ).mappings().all()
+    return [Player(row["name"], row["position"]) for row in rows]
+
+
+def save_players(player_objs: List[Player]) -> None:
+    _init_storage()
+    serialized = [p.to_dict() for p in player_objs]
+
+    # Simple full-rewrite is fine for a small table like this
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM players"))
+        if serialized:
+            conn.execute(
+                text("INSERT INTO players (name, position) VALUES (:name, :position)"),
+                serialized
+            )
+
+    # Optional: keep JSON snapshot for readability/manual edits
+    try:
+        with open(PLAYERS_TEMPLATE, "w", encoding="utf-8") as f:
+            json.dump(serialized, f, indent=2)
+    except OSError:
+        pass
+
 
 # ---------- Grouping ----------
-def group_players_by_position(players):
+def group_players_by_position(players: List[Player]) -> Dict[str, List[Player]]:
     grouped = defaultdict(list)
     for player in players:
         grouped[player.position].append(player)
@@ -94,7 +212,7 @@ def group_players_by_position(players):
     return ordered
 
 # ---------- NFL.com ----------
-def fetch_nfl_rankings(position, week):
+def fetch_nfl_rankings(position: str, week: int) -> BeautifulSoup:
     url = f"https://fantasy.nfl.com/research/rankings?leagueId=0&position={position}&statSeason={CURRENT_SEASON}&statType=weekStats&week={week}"
     try:
         resp = requests.get(url, timeout=10)
@@ -102,7 +220,7 @@ def fetch_nfl_rankings(position, week):
     except Exception:
         return BeautifulSoup("", "html.parser")
 
-def get_nfl_ranks(doc, player_names):
+def get_nfl_ranks(doc: BeautifulSoup, player_names: List[str]) -> Dict[str, int]:
     ranks = {}
     for name in player_names:
         ranks[name] = NOT_RANKED
@@ -122,7 +240,7 @@ def get_nfl_ranks(doc, player_names):
     return ranks
 
 # ---------- RotoPat ----------
-def fetch_rotopat_doc(position, week):
+def fetch_rotopat_doc(position: str, week: int) -> BeautifulSoup:
     roto_position = "te-k-def" if position in ["TE", "K", "DEF"] else position.lower()
     url = f"https://www.nbcsports.com/fantasy/football/news/{CURRENT_SEASON}-week-{week}-fantasy-football-rankings-{roto_position}"
     try:
@@ -131,7 +249,7 @@ def fetch_rotopat_doc(position, week):
     except Exception:
         return BeautifulSoup("", "html.parser")
 
-def get_rotopat_ranks(doc, player_names):
+def get_rotopat_ranks(doc: BeautifulSoup, player_names: List[str]) -> Dict[str, int]:
     ranks = {}
     for name in player_names:
         normalized_target = normalize_name(name)
@@ -156,7 +274,7 @@ def get_rotopat_ranks(doc, player_names):
     return ranks
 
 # ---------- FantasyPros ----------
-def fetch_fantasypros_ecr(position):
+def fetch_fantasypros_ecr(position: str) -> Dict[str, Any]:
     pos_map = {"QB": "qb", "RB": "rb", "WR": "wr", "TE": "te", "K": "k", "DEF": "dst"}
     pos_param = pos_map.get(position.upper())
     if not pos_param:
@@ -169,7 +287,7 @@ def fetch_fantasypros_ecr(position):
     except Exception:
         return {}
 
-def get_fantasypros_ranks(data, player_names):
+def get_fantasypros_ranks(data: Dict[str, Any], player_names: List[str]) -> Dict[str, int]:
     ranks = {}
     for name in player_names:
         normalized_target = normalize_name(name)
@@ -181,7 +299,7 @@ def get_fantasypros_ranks(data, player_names):
     return ranks
 
 # ---------- Ranking logic ----------
-def get_rankings(week=None):
+def get_rankings(week: Optional[int] = None) -> Dict[str, List[Dict[str, Any]]]:
     week = week or get_current_nfl_week()
     players = load_players()
     grouped = group_players_by_position(players)
@@ -261,5 +379,5 @@ def api_rankings():
 
 # ---------- Entry Point ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5050))
     app.run(host="0.0.0.0", port=port)

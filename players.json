@@ -1,15 +1,19 @@
 [
   {
-    "name": "Patrick Mahomes",
-    "position": "QB"
+    "name": "Bijan Robinson",
+    "position": "RB"
+  },
+  {
+    "name": "Brandon Aubrey",
+    "position": "K"
   },
   {
     "name": "Brian Thomas Jr.",
     "position": "WR"
   },
   {
-    "name": "Terry McLaurin",
-    "position": "WR"
+    "name": "Buffalo Bills",
+    "position": "DEF"
   },
   {
     "name": "Chris Olave",
@@ -20,20 +24,12 @@
     "position": "WR"
   },
   {
-    "name": "Wan'Dale Robinson",
-    "position": "WR"
+    "name": "Kyle Pitts",
+    "position": "TE"
   },
   {
-    "name": "Darnell Mooney",
-    "position": "WR"
-  },
-  {
-    "name": "Bijan Robinson",
-    "position": "RB"
-  },
-  {
-    "name": "Tony Pollard",
-    "position": "RB"
+    "name": "Patrick Mahomes",
+    "position": "QB"
   },
   {
     "name": "Quinshon Judkins",
@@ -44,16 +40,20 @@
     "position": "RB"
   },
   {
+    "name": "Terry McLaurin",
+    "position": "WR"
+  },
+  {
+    "name": "Tony Pollard",
+    "position": "RB"
+  },
+  {
     "name": "Trey McBride",
     "position": "TE"
   },
   {
-    "name": "Brandon Aubrey",
-    "position": "K"
-  },
-  {
-    "name": "Arizona Cardinals",
-    "position": "DEF"
+    "name": "Wan'Dale Robinson",
+    "position": "WR"
   },
   {
     "name": "Woody Marks",

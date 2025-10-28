@@ -6,6 +6,7 @@ env/
 # Byte-compiled / cache files
 __pycache__/
 *.py[cod]
+players.db
 
 # VS Code settings
 .vscode/
