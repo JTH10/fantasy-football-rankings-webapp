@@ -98,7 +98,7 @@ DEFAULT_PLAYERS = [
     {"name": "Quinshon Judkins", "position": "RB"},
     {"name": "Rhamondre Stevenson", "position": "RB"},
     {"name": "Woody Marks", "position": "RB"},
-    {"name": "Kyle Pitts", "position": "RB"},
+    {"name": "Kyle Pitts", "position": "TE"},
     {"name": "Trey McBride", "position": "TE"},
     {"name": "Brandon Aubrey", "position": "K"},
     {"name": "Buffalo Bills", "position": "DEF"}
@@ -184,15 +184,25 @@ def _init_storage():
             )
         """))
 
-        # Seed from template once if empty
-        count = conn.execute(text("SELECT COUNT(*) FROM players")).scalar() or 0
-        if count == 0:
-            seed_players = _load_template_players()
-            if seed_players:
-                conn.execute(
-                    text("INSERT INTO players (name, position) VALUES (:name, :position)"),
-                    seed_players
-                )
+        # Optional: case-insensitive uniqueness
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS players_name_lower_idx ON players (lower(name))"))
+
+        # Seed from template once if empty, with logging so we can see what's happening on Render
+        try:
+            count = conn.execute(text("SELECT COUNT(*) FROM players")).scalar() or 0
+            logger.info("players table row count BEFORE seed: %s", count)
+            if count == 0:
+                seed_players = _load_template_players()
+                logger.info("seeding %d players from template/defaults", len(seed_players))
+                if seed_players:
+                    conn.execute(
+                        text("INSERT INTO players (name, position) VALUES (:name, :position)"),
+                        seed_players
+                    )
+                count_after = conn.execute(text("SELECT COUNT(*) FROM players")).scalar() or 0
+                logger.info("players table row count AFTER seed: %s", count_after)
+        except Exception as e:
+            logger.exception("Seeding failed: %s", e)
 
     _storage_initialized = True
 
@@ -203,6 +213,7 @@ def load_players() -> List[Player]:
         rows = conn.execute(
             text("SELECT name, position FROM players ORDER BY name")
         ).mappings().all()
+    logger.info("load_players returned %d rows", len(rows))
     return [Player(row["name"], row["position"]) for row in rows]
 
 
@@ -364,6 +375,13 @@ def get_rankings(week: Optional[int] = None) -> Dict[str, List[Dict[str, Any]]]:
 
 # ---------- Flask App ----------
 app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# Ensure storage is initialized as early as possible (and log outcome)
+try:
+    _init_storage()
+    logger.info("Storage initialized at startup")
+except Exception as e:
+    logger.exception("Storage init at startup failed: %s", e)
 
 @app.route('/')
 def home():
