@@ -30,6 +30,7 @@ License: MIT
 import datetime
 import json
 import os
+import logging
 import re
 from collections import defaultdict
 from html import unescape
@@ -72,6 +73,11 @@ else:
     DB_URL = f"sqlite:///{os.path.join(BASE_DIR, 'players.db')}"
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info("DB URL scheme in use: %s", DB_URL.split(":", 1)[0])  # expect postgresql+psycopg or sqlite
+
 
 
 PLAYERS_TEMPLATE = os.path.join(BASE_DIR, "players.json")
