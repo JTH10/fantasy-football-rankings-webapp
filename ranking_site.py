@@ -41,17 +41,38 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify, render_template, request
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DB_URL = os.environ.get("DATABASE_URL")  # Supabase on Render
-if not DB_URL:
-    # Fallback to local SQLite if DATABASE_URL is not set
+def _use_psycopg3_driver(url: str) -> str:
+    """Force SQLAlchemy to use psycopg3 driver for PostgreSQL."""
+    if not url or not url.startswith("postgresql"):
+        return url
+    parsed = urlparse(url)
+    scheme = "postgresql+psycopg"
+    return urlunparse(parsed._replace(scheme=scheme))
+
+def _ensure_ssl_in_url(url: str) -> str:
+    """Add ?sslmode=require if not present (needed for Supabase)."""
+    if not url or not url.startswith("postgres"):
+        return url
+    parsed = urlparse(url)
+    qs = dict(parse_qsl(parsed.query))
+    qs.setdefault("sslmode", "require")
+    new = parsed._replace(query=urlencode(qs))
+    return urlunparse(new)
+
+DB_URL = os.environ.get("DATABASE_URL")
+if DB_URL:
+    DB_URL = _use_psycopg3_driver(_ensure_ssl_in_url(DB_URL))
+else:
     DB_URL = f"sqlite:///{os.path.join(BASE_DIR, 'players.db')}"
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
+
 
 PLAYERS_TEMPLATE = os.path.join(BASE_DIR, "players.json")
 NOT_RANKED = 1000
