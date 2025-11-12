@@ -35,6 +35,7 @@ import re
 from collections import defaultdict
 from html import unescape
 from typing import Any, Dict, List, Optional
+from logging_setup import setup_logging
 
 # third-party
 import requests
@@ -46,6 +47,9 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 
 # ---------- Config ----------
+# Initialize logging before anything else
+setup_logging()
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _use_psycopg3_driver(url: str) -> str:
@@ -154,8 +158,9 @@ def _ensure_template_file():
     try:
         with open(PLAYERS_TEMPLATE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_PLAYERS, f, indent=2)
+        logger.info("created new template file at %s", PLAYERS_TEMPLATE)
     except OSError:
-        pass
+        logger.exception("failed to write JSON snapshot to %s", PLAYERS_TEMPLATE)
 
 
 def _load_template_players():
@@ -163,48 +168,70 @@ def _load_template_players():
     try:
         with open(PLAYERS_TEMPLATE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return [p for p in data if isinstance(p, dict) and "name" in p and "position" in p]
-    except (OSError, json.JSONDecodeError):
-        return DEFAULT_PLAYERS.copy()
+        logger.info("loaded %d template players from %s", len(data), PLAYERS_TEMPLATE)
+        return data
+    except FileNotFoundError:
+        logger.exception("template players file not found at %s", PLAYERS_TEMPLATE)
+        return []
+    except json.JSONDecodeError:
+        logger.exception("template players file is not valid JSON: %s", PLAYERS_TEMPLATE)
+        return []
+    except Exception:
+        logger.exception("unexpected error loading template players from %s", PLAYERS_TEMPLATE)
+        return []
 
 
 _storage_initialized = False
-
 def _init_storage():
+    """Ensure the players table exists and seed it once, with real logging."""
     global _storage_initialized
     if _storage_initialized:
         return
 
-    # Create table if it doesn't exist (works on both SQLite and Postgres)
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS players (
-                name TEXT PRIMARY KEY,
-                position TEXT NOT NULL
+    logger.info("storage_init_start")
+
+    try:
+        # Create table if it doesn't exist (works on both SQLite and Postgres)
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS players (
+                    name TEXT PRIMARY KEY,
+                    position TEXT NOT NULL
+                )
+            """))
+
+            # Optional: case-insensitive uniqueness
+            conn.execute(
+                text("CREATE UNIQUE INDEX IF NOT EXISTS players_name_lower_idx ON players (lower(name))")
             )
-        """))
 
-        # Optional: case-insensitive uniqueness
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS players_name_lower_idx ON players (lower(name))"))
-
-        # Seed from template once if empty, with logging so we can see what's happening on Render
-        try:
+            # Seed from template once if empty, with logging so we can see what's happening on Render
             count = conn.execute(text("SELECT COUNT(*) FROM players")).scalar() or 0
             logger.info("players table row count BEFORE seed: %s", count)
+
             if count == 0:
                 seed_players = _load_template_players()
                 logger.info("seeding %d players from template/defaults", len(seed_players))
                 if seed_players:
                     conn.execute(
                         text("INSERT INTO players (name, position) VALUES (:name, :position)"),
-                        seed_players
+                        seed_players,
                     )
                 count_after = conn.execute(text("SELECT COUNT(*) FROM players")).scalar() or 0
                 logger.info("players table row count AFTER seed: %s", count_after)
-        except Exception as e:
-            logger.exception("Seeding failed: %s", e)
+            else:
+                logger.info("seeding skipped: players table already has data")
+
+        logger.info("storage_init_success")
+
+    except Exception:
+        # No more silent fail
+        logger.exception("storage_init_failed")
+        # optional: raise to fail fast
+        # raise
 
     _storage_initialized = True
+
 
 
 def load_players() -> List[Player]:
@@ -235,7 +262,7 @@ def save_players(player_objs: List[Player]) -> None:
         with open(PLAYERS_TEMPLATE, "w", encoding="utf-8") as f:
             json.dump(serialized, f, indent=2)
     except OSError:
-        pass
+        logger.exception("failed to write JSON snapshot to %s", PLAYERS_TEMPLATE)
 
 
 # ---------- Grouping ----------
@@ -380,8 +407,8 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 try:
     _init_storage()
     logger.info("Storage initialized at startup")
-except Exception as e:
-    logger.exception("Storage init at startup failed: %s", e)
+except Exception:
+    logger.exception("Storage init at startup failed")
 
 @app.route('/')
 def home():
@@ -391,36 +418,81 @@ def home():
 
 @app.route('/players', methods=['GET'])
 def api_get_players():
-    grouped = group_players_by_position(load_players())
-    return jsonify({pos: [p.to_dict() for p in grouped[pos]] for pos in grouped})
+    try:
+        grouped = group_players_by_position(load_players())
+        return jsonify({pos: [p.to_dict() for p in grouped[pos]] for pos in grouped})
+    except Exception:
+        logger.exception("GET /players failed")
+        return jsonify({"error": "internal error"}), 500
 
 @app.route('/players', methods=['POST'])
 def api_add_player():
-    data = request.get_json()
+    # 1) parse/validate
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        logger.exception("POST /players invalid JSON")
+        return jsonify({"error": "Bad payload"}), 400
+
     if not data or 'name' not in data or 'position' not in data:
         return jsonify({"error": "Bad payload"}), 400
-    players = load_players()
-    if any(p.name.strip().lower() == data['name'].strip().lower() for p in players):
+
+    name = data['name'].strip()
+    position = data['position'].strip()
+
+    try:
+        players = load_players()
+    except Exception:
+        logger.exception("POST /players failed to load existing players")
+        return jsonify({"error": "internal error"}), 500
+
+    # 2) uniqueness check
+    if any(p.name.strip().lower() == name.lower() for p in players):
         return jsonify({"error": "Player already exists"}), 409
-    players.append(Player(data['name'].strip(), data['position'].strip()))
-    save_players(players)
-    return jsonify({"message": "Player added"}), 201
+
+    # 3) save
+    try:
+        players.append(Player(name, position))
+        save_players(players)
+        logger.info("POST /players added player=%s position=%s", name, position)
+        return jsonify({"message": "Player added"}), 201
+    except Exception:
+        logger.exception("POST /players failed to save player=%s", name)
+        return jsonify({"error": "internal error"}), 500
 
 @app.route('/players/<path:name>', methods=['DELETE'])
 def api_delete_player(name):
     name_norm = name.strip().lower()
-    players = load_players()
+    try:
+        players = load_players()
+    except Exception:
+        logger.exception("DELETE /players/%s failed to load players", name)
+        return jsonify({"error": "internal error"}), 500
+
     new_players = [p for p in players if p.name.strip().lower() != name_norm]
+
     if len(new_players) == len(players):
         return jsonify({"error": "Player not found"}), 404
-    save_players(new_players)
-    return jsonify({"message": "Player deleted"}), 200
+
+    try:
+        save_players(new_players)
+        logger.info("DELETE /players removed player=%s", name_norm)
+        return jsonify({"message": "Player deleted"}), 200
+    except Exception:
+        logger.exception("DELETE /players/%s failed to save updated list", name_norm)
+        return jsonify({"error": "internal error"}), 500
+
 
 @app.route('/rankings')
 def api_rankings():
-    week_param = request.args.get('week')
-    week = int(week_param) if week_param and week_param.isdigit() and 1 <= int(week_param) <= 17 else get_current_nfl_week()
-    return jsonify(get_rankings(week))
+    try:
+        week_param = request.args.get('week')
+        week = int(week_param) if week_param and week_param.isdigit() and 1 <= int(week_param) <= 17 else get_current_nfl_week()
+        return jsonify(get_rankings(week))
+    except Exception:
+        logger.exception("GET /rankings failed")
+        return jsonify({"error": "internal error"}), 500
+
 
 # ---------- Entry Point ----------
 if __name__ == "__main__":
